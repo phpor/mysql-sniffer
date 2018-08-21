@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"encoding/json"
 )
 
 const (
@@ -82,12 +83,20 @@ type source struct {
 	qbytes    uint64
 	qdata     *queryData
 	qtext     string
+	sql 	  string
 }
 
 type queryData struct {
 	count uint64
 	bytes uint64
 	times [TIME_BUCKETS]uint64
+}
+
+type outPutData struct {
+	Src string
+	Sql string
+	Bytes uint64
+	Time float64
 }
 
 var start int64 = UnixNow()
@@ -100,6 +109,7 @@ var dirty bool = false
 var format []interface{}
 var port uint16
 var times [TIME_BUCKETS]uint64
+var outformat string
 
 var stats struct {
 	packets struct {
@@ -121,6 +131,8 @@ func main() {
 	var period *int = flag.Int("t", 10, "Seconds between outputting status")
 	var displaycount *int = flag.Int("d", 15, "Display this many queries in status updates")
 	var doverbose *bool = flag.Bool("v", false, "Print every query received (spammy)")
+	var output *string = flag.String("o", "text", "format for verbose, available: text(default), json")
+
 	var nocleanquery *bool = flag.Bool("n", false, "no clean queries")
 	var formatstr *string = flag.String("f", "#s:#q", "Format for output aggregation")
 	var sortby *string = flag.String("s", "count", "Sort by: count, max, avg, maxbytes, avgbytes")
@@ -128,6 +140,7 @@ func main() {
 	flag.Parse()
 
 	verbose = *doverbose
+	outformat = *output
 	noclean = *nocleanquery
 	port = uint16(*lport)
 	dirty = *ldirty
@@ -152,21 +165,23 @@ func main() {
 		log.Fatalf("Failed to set port filter: %s", err.Error())
 	}
 
-	last := UnixNow()
 	var pkt *pcap.Packet = nil
 	var rv int32 = 0
 
+	// simple output printer... this should be super fast since we expect that a
+	// system like this will have relatively few unique queries once they're
+	// canonicalized.
+	if !verbose {
+		go func() {
+			ticker := time.NewTicker(time.Duration(*period) * time.Second)
+			for range ticker.C {
+				handleStatusUpdate(*displaycount, *sortby, *cutoff)
+			}
+		}()
+	}
 	for rv = 0; rv >= 0; {
 		for pkt, rv = iface.NextEx(); pkt != nil; pkt, rv = iface.NextEx() {
 			handlePacket(pkt)
-
-			// simple output printer... this should be super fast since we expect that a
-			// system like this will have relatively few unique queries once they're
-			// canonicalized.
-			if !verbose && querycount%1000 == 0 && last < UnixNow()-int64(*period) {
-				last = UnixNow()
-				handleStatusUpdate(*displaycount, *sortby, *cutoff)
-			}
 		}
 	}
 }
@@ -336,8 +351,18 @@ func processPacket(rs *source, request bool, data []byte) {
 
 		// If we're in verbose mode, just dump statistics from this one.
 		if verbose && len(rs.qtext) > 0 {
-			log.Printf("    %s%s %s## %sbytes: %d time: %0.2f%s\n", COLOR_GREEN, rs.qtext, COLOR_RED,
-				COLOR_YELLOW, rs.qbytes, float64(reqtime)/1000000, COLOR_DEFAULT)
+			if outformat == "json" {
+				result,_ := json.Marshal(&outPutData{
+					Src: rs.src,
+					Sql: rs.sql,
+					Bytes: rs.qbytes,
+					Time: float64(reqtime)/1000000})
+				log.Printf("%s\n", string(result))
+			} else {
+				log.Printf("    %s%s %s## %sbytes: %d time: %0.2f%s\n", COLOR_GREEN, rs.qtext, COLOR_RED,
+					COLOR_YELLOW, rs.qbytes, float64(reqtime)/1000000, COLOR_DEFAULT)
+			}
+
 		}
 
 		return
@@ -354,7 +379,11 @@ func processPacket(rs *source, request bool, data []byte) {
 	// Convert this request into whatever format the user wants.
 	querycount++
 	var text string
-
+	rawSql := string(pdata)
+	sql := rawSql
+	if !dirty {
+		sql = cleanupQuery(pdata)
+	}
 	for _, item := range format {
 		switch item.(type) {
 		case int:
@@ -362,16 +391,12 @@ func processPacket(rs *source, request bool, data []byte) {
 			case F_NONE:
 				log.Fatalf("F_NONE in format string")
 			case F_QUERY:
-				if dirty {
-					text += string(pdata)
-				} else {
-					text += cleanupQuery(pdata)
-				}
+				text += sql
 			case F_ROUTE:
 				// Routes are in the query like:
 				//     SELECT /* hostname:route */ FROM ...
 				// We remove the hostname so routes can be condensed.
-				parts := strings.SplitN(string(pdata), " ", 5)
+				parts := strings.SplitN(rawSql, " ", 5)
 				if len(parts) >= 4 && parts[1] == "/*" && parts[3] == "*/" {
 					if strings.Contains(parts[2], ":") {
 						text += strings.SplitN(parts[2], ":", 2)[1]
@@ -379,7 +404,7 @@ func processPacket(rs *source, request bool, data []byte) {
 						text += parts[2]
 					}
 				} else {
-					text += "(unknown) " + cleanupQuery(pdata)
+					text += "(unknown) " + sql
 				}
 			case F_SOURCE:
 				text += rs.src
@@ -401,6 +426,7 @@ func processPacket(rs *source, request bool, data []byte) {
 	}
 	qdata.count++
 	qdata.bytes += plen
+	rs.sql = sql
 	rs.qtext, rs.qdata, rs.qbytes = text, qdata, plen
 }
 
