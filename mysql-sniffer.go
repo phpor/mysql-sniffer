@@ -38,6 +38,7 @@ const (
 	TOKEN_NUMBER     = 2
 	TOKEN_WHITESPACE = 3
 	TOKEN_OTHER      = 4
+	TOKEN_COMMENT	 = 5
 
 	// Internal tuning
 	TIME_BUCKETS = 10000
@@ -532,6 +533,14 @@ func scanToken(query []byte) (length int, thistype int) {
 	// peek at the first byte, then loop
 	b := query[0]
 	switch {
+	case b == '/':
+		if (len(query) > 3 && query[1] == '*') {
+			for i := 2; i < len(query); i++ {
+				if (query[i-1] == '*' && query[i] =='/') {
+					return i + 1, TOKEN_COMMENT
+				}
+			}
+		}
 	case b == 39 || b == 34: // '"
 		started_with := b
 		escaped := false
@@ -610,7 +619,7 @@ func cleanupQuery(query []byte) string {
 		case TOKEN_NUMBER, TOKEN_QUOTE:
 			qspace = append(qspace, "?")
 
-		case TOKEN_WHITESPACE:
+		case TOKEN_WHITESPACE,TOKEN_COMMENT:
 			qspace = append(qspace, " ")
 
 		default:
