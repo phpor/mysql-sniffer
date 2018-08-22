@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 	"encoding/json"
+	"sync"
 )
 
 const (
@@ -61,11 +62,6 @@ const (
 	F_SOURCE
 	F_SOURCEIP
 )
-
-type packet struct {
-	request bool // request or response
-	data    []byte
-}
 
 type sortable struct {
 	value float64
@@ -101,9 +97,13 @@ type outPutData struct {
 }
 
 var start int64 = UnixNow()
-var qbuf map[string]*queryData = make(map[string]*queryData)
+var qbuf = struct{
+	sync.RWMutex
+	buf map[string]*queryData
+}{buf: make(map[string]*queryData)}
+
 var querycount int
-var chmap map[string]*source = make(map[string]*source)
+
 var verbose bool = false
 var noclean bool = false
 var dirty bool = false
@@ -112,13 +112,13 @@ var port uint16
 var times [TIME_BUCKETS]uint64
 var outformat string
 
+
 var stats struct {
 	packets struct {
 		rcvd      uint64
 		rcvd_sync uint64
 	}
 	desyncs uint64
-	streams uint64
 }
 
 func UnixNow() int64 {
@@ -223,21 +223,22 @@ func handleStatusUpdate(displaycount int, sortby string, cutoff int) {
 		float64(querycount)/elapsed, COLOR_DEFAULT)
 	log.SetFlags(0)
 
-	log.Printf("%d packets (%0.2f%% on synchronized streams) / %d desyncs / %d streams",
+	log.Printf("%d packets (%0.2f%% on synchronized streams) / %d desyncs",
 		stats.packets.rcvd, float64(stats.packets.rcvd_sync)/float64(stats.packets.rcvd)*100,
-		stats.desyncs, stats.streams)
+		stats.desyncs)
 
 	// global timing values
 	gmin, gavg, gmax := calculateTimes(&times)
 	log.Printf("%0.2fms min / %0.2fms avg / %0.2fms max query times", gmin, gavg, gmax)
-	log.Printf("%d unique results in this filter", len(qbuf))
+	log.Printf("%d unique results in this filter", len(qbuf.buf))
 	log.Printf(" ")
 	log.Printf("%s count     %sqps     %s  min    avg   max      %sbytes      per qry%s",
 		COLOR_YELLOW, COLOR_CYAN, COLOR_YELLOW, COLOR_GREEN, COLOR_DEFAULT)
 
 	// we cheat so badly here...
-	var tmp sortableSlice = make(sortableSlice, 0, len(qbuf))
-	for q, c := range qbuf {
+	var tmp sortableSlice = make(sortableSlice, 0, len(qbuf.buf))
+	qbuf.RLock()
+	for q, c := range qbuf.buf {
 		qps := float64(c.count) / elapsed
 		if qps < float64(cutoff) {
 			continue
@@ -262,6 +263,7 @@ func handleStatusUpdate(displaycount int, sortby string, cutoff int) {
 			COLOR_YELLOW, c.count, COLOR_CYAN, qps, COLOR_YELLOW, qmin, qavg, qmax,
 			COLOR_GREEN, c.bytes, bavg, COLOR_WHITE, q, COLOR_DEFAULT)})
 	}
+	qbuf.RUnlock()
 	sort.Sort(tmp)
 
 	// now print top to bottom, since our sorted list is sorted backwards
@@ -420,11 +422,13 @@ func processPacket(rs *source, request bool, data []byte) {
 			log.Fatalf("Unknown type in format string")
 		}
 	}
-	qdata, ok := qbuf[text]
+	qbuf.Lock()
+	qdata, ok := qbuf.buf[text]
 	if !ok {
 		qdata = &queryData{}
-		qbuf[text] = qdata
+		qbuf.buf[text] = qdata
 	}
+	qbuf.Unlock()
 	qdata.count++
 	qdata.bytes += plen
 	rs.sql = sql
@@ -505,15 +509,9 @@ func handlePacket(pkt *pcap.Packet) {
 		log.Fatalf("got packet src = %d, dst = %d", srcPort, dstPort)
 	}
 
-	// Get the data structure for this source, then do something.
-	rs, ok := chmap[src]
-	if !ok {
-		srcip := src[0:strings.Index(src, ":")]
-		rs = &source{src: src, srcip: srcip, synced: false}
-		stats.streams++
-		chmap[src] = rs
-	}
 
+	srcip := src[0:strings.Index(src, ":")]
+	rs := &source{src: src, srcip: srcip, synced: false}
 	// Now with a source, process the packet.
 	processPacket(rs, request, pkt.Data[pos:])
 }
