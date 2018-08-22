@@ -5,7 +5,6 @@
  * diagnostic information on the realtime queries your database is handling.
  *
  * FIXME: this assumes IPv4.
- * FIXME: tokenizer doesn't handle negative numbers or floating points.
  * FIXME: canonicalizer should collapse "IN (?,?,?,?)" and "VALUES (?,?,?,?)"
  * FIXME: tokenizer breaks on '"' or similarly embedded quotes
  * FIXME: tokenizer parses numbers in words wrong, i.e. s2compiled -> s?compiled
@@ -593,10 +592,12 @@ func scanToken(query []byte) (length int, thistype int) {
 		}
 		return len(query), TOKEN_QUOTE
 
-	case b >= 48 && b <= 57: // 0-9
+	case (b >= 48 && b <= 57) || b == '-': // 0-9 或 负号
 		for i := 1; i < len(query); i++ {
 			switch {
 			case query[i] >= 48 && query[i] <= 57: // 0-9
+				// do nothing
+			case query[i] == '.': // 尽管这样判断浮点数并不严谨，但是大部分情况下时可以蒙混过关的
 				// do nothing
 			default:
 				return i, TOKEN_NUMBER
