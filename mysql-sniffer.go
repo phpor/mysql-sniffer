@@ -76,7 +76,7 @@ type source struct {
 	reqbuffer []byte
 	resbuffer []byte
 	reqSent   *time.Time
-	reqTimes  [TIME_BUCKETS]uint64
+	reqTimes  []uint64
 	qbytes    uint64
 	qdata     *queryData
 	qtext     string
@@ -86,7 +86,7 @@ type source struct {
 type queryData struct {
 	count uint64
 	bytes uint64
-	times [TIME_BUCKETS]uint64
+	times []uint64
 }
 
 type outPutData struct {
@@ -103,17 +103,27 @@ var qbuf = struct{
 }{buf: make(map[string]*queryData)}
 
 var querycount int
+var chmap = struct {
+	sync.RWMutex
+	buf map[string]*source
+}{buf : make(map[string]*source)}
 
 var verbose bool = false
 var noclean bool = false
 var dirty bool = false
 var format []interface{}
 var port uint16
-var times [TIME_BUCKETS]uint64
+var times = struct {
+	sync.RWMutex
+	data []uint64
+}{}
+var interval int64
+
 var outformat string
 
 
 var stats struct {
+	sync.RWMutex
 	packets struct {
 		rcvd      uint64
 		rcvd_sync uint64
@@ -147,6 +157,7 @@ func main() {
 	dirty = *ldirty
 	parseFormat(*formatstr)
 	rand.Seed(time.Now().UnixNano())
+	interval = int64(*period)
 
 	log.SetPrefix("")
 	log.SetFlags(0)
@@ -187,7 +198,7 @@ func main() {
 	}
 }
 
-func calculateTimes(timings *[TIME_BUCKETS]uint64) (fmin, favg, fmax float64) {
+func calculateTimes(timings *[]uint64) (fmin, favg, fmax float64) {
 	var counts, total, min, max, avg uint64 = 0, 0, 0, 0, 0
 	has_min := false
 	for _, val := range *timings {
@@ -215,30 +226,42 @@ func calculateTimes(timings *[TIME_BUCKETS]uint64) (fmin, favg, fmax float64) {
 
 func handleStatusUpdate(displaycount int, sortby string, cutoff int) {
 	elapsed := float64(UnixNow() - start)
-
+	count := querycount
+	querycount = 0
 	// print status bar
 	log.Printf("\n")
 	log.SetFlags(log.Ldate | log.Ltime)
-	log.Printf("%s%d total queries, %0.2f per second%s", COLOR_RED, querycount,
-		float64(querycount)/elapsed, COLOR_DEFAULT)
+	log.Printf("%s%d total queries, %0.2f per second%s", COLOR_RED, count,
+		float64(count)/float64(interval), COLOR_DEFAULT)
 	log.SetFlags(0)
 
+	stats.Lock()
 	log.Printf("%d packets (%0.2f%% on synchronized streams) / %d desyncs",
 		stats.packets.rcvd, float64(stats.packets.rcvd_sync)/float64(stats.packets.rcvd)*100,
 		stats.desyncs)
+	stats.desyncs = 0
+	stats.packets.rcvd = 0
+	stats.packets.rcvd_sync = 0
+	stats.Unlock()
+
 
 	// global timing values
-	gmin, gavg, gmax := calculateTimes(&times)
+	times.Lock()
+	gmin, gavg, gmax := calculateTimes(&times.data)
+	times.data = nil
+	times.Unlock()
+
 	log.Printf("%0.2fms min / %0.2fms avg / %0.2fms max query times", gmin, gavg, gmax)
 	log.Printf("%d unique results in this filter", len(qbuf.buf))
 	log.Printf(" ")
-	log.Printf("%s count     %sqps     %s  min    avg   max      %sbytes      per qry%s",
+	log.Printf("%s count     %sqps     %s  min(ms)    avg(ms)   max(ms)      %sbytes      per qry%s",
 		COLOR_YELLOW, COLOR_CYAN, COLOR_YELLOW, COLOR_GREEN, COLOR_DEFAULT)
 
 	// we cheat so badly here...
 	var tmp sortableSlice = make(sortableSlice, 0, len(qbuf.buf))
-	qbuf.RLock()
+	qbuf.Lock()
 	for q, c := range qbuf.buf {
+		delete(qbuf.buf, q)
 		qps := float64(c.count) / elapsed
 		if qps < float64(cutoff) {
 			continue
@@ -263,7 +286,8 @@ func handleStatusUpdate(displaycount int, sortby string, cutoff int) {
 			COLOR_YELLOW, c.count, COLOR_CYAN, qps, COLOR_YELLOW, qmin, qavg, qmax,
 			COLOR_GREEN, c.bytes, bavg, COLOR_WHITE, q, COLOR_DEFAULT)})
 	}
-	qbuf.RUnlock()
+	qbuf.buf = make(map[string]*queryData)
+	qbuf.Unlock()
 	sort.Sort(tmp)
 
 	// now print top to bottom, since our sorted list is sorted backwards
@@ -281,6 +305,7 @@ func processPacket(rs *source, request bool, data []byte) {
 	//		log.Printf("[%s] request=%t, got %d bytes", rs.src, request,
 	//			len(data))
 
+	stats.Lock()
 	stats.packets.rcvd++
 	if rs.synced {
 		stats.packets.rcvd_sync++
@@ -307,7 +332,7 @@ func processPacket(rs *source, request bool, data []byte) {
 		rs.resbuffer = nil
 		ptype, pdata = 0, data
 	}
-
+	stats.Unlock()
 	// The synchronization logic: if we're not presently, then we want to
 	// keep going until we are capable of carving off of a request/query.
 	if !rs.synced {
@@ -340,14 +365,16 @@ func processPacket(rs *source, request bool, data []byte) {
 		reqtime = uint64(time.Since(*rs.reqSent).Nanoseconds())
 
 		// We keep track of per-source, global, and per-query timings.
-		randn := rand.Intn(TIME_BUCKETS)
-		rs.reqTimes[randn] = reqtime
-		times[randn] = reqtime
+
+		rs.reqTimes = append(rs.reqTimes, reqtime)
+		times.Lock()
+		times.data = append(times.data, reqtime)
+		times.Unlock()
 		if rs.qdata != nil {
 			// This should never fail but it has. Probably because of a
 			// race condition I need to suss out, or sharing between
 			// two different goroutines. :(
-			rs.qdata.times[randn] = reqtime
+			rs.qdata.times = append(rs.qdata.times, reqtime)
 			rs.qdata.bytes += plen
 		}
 		rs.reqSent = nil
@@ -362,7 +389,7 @@ func processPacket(rs *source, request bool, data []byte) {
 					Time: float64(reqtime)/1000000})
 				log.Printf("%s\n", string(result))
 			} else {
-				log.Printf("    %s%s %s## %sbytes: %d time: %0.2f%s\n", COLOR_GREEN, rs.qtext, COLOR_RED,
+				log.Printf("    %s%s %s## %sbytes: %d time: %0.2f%s ms\n", COLOR_GREEN, rs.qtext, COLOR_RED,
 					COLOR_YELLOW, rs.qbytes, float64(reqtime)/1000000, COLOR_DEFAULT)
 			}
 
@@ -509,9 +536,17 @@ func handlePacket(pkt *pcap.Packet) {
 		log.Fatalf("got packet src = %d, dst = %d", srcPort, dstPort)
 	}
 
-
-	srcip := src[0:strings.Index(src, ":")]
-	rs := &source{src: src, srcip: srcip, synced: false}
+	// Get the data structure for this source, then do something.
+	chmap.Lock()
+	rs, ok := chmap.buf[src]
+	if !ok {
+		srcip := src[0:strings.Index(src, ":")]
+		rs = &source{src: src, srcip: srcip, synced: false}
+		chmap.buf[src] = rs
+	} else {
+		delete(chmap.buf, src)
+	}
+	chmap.Unlock()
 	// Now with a source, process the packet.
 	processPacket(rs, request, pkt.Data[pos:])
 }
